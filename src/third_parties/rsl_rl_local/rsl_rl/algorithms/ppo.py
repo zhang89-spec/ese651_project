@@ -147,7 +147,70 @@ class PPO:
             _,  # rnd_state_batch - not used anymore
         ) in generator:
             # TODO ----- START -----
-            # Implement the PPO update step
+            # 1. Evaluate current policy and value function using the saved observations
+            if self.actor_critic.is_recurrent:
+                # Handle Recurrent Neural Networks (RNNs/LSTMs) if enabled
+                current_values = self.actor_critic.evaluate(critic_observations, hidden_states=hidden_states[1], masks=episode_masks).squeeze()
+                current_log_probs, entropy = self.actor_critic.evaluate_actions(observations, sampled_actions, hidden_states=hidden_states[0], masks=episode_masks)
+                current_log_probs = current_log_probs.squeeze()
+            else:
+                # Standard Feed-Forward Neural Network
+                current_values = self.actor_critic.evaluate(critic_observations).squeeze()
+
+                # 1. First, tell the actor to build the distribution based on current observations
+                self.actor_critic.update_distribution(observations)
+                # 2. Get the log probability of the actions taken
+                current_log_probs = self.actor_critic.get_actions_log_prob(sampled_actions).squeeze()
+                # 3. Get the entropy (using the @property you have in actor_critic.py)
+                entropy = self.actor_critic.entropy
+
+            # --- PREVENT TENSOR BROADCASTING BUG ---
+            # This forces all tensors to be flat 1D lists so they multiply line-by-line
+            prev_log_probs = prev_log_probs.squeeze()
+            advantage_estimates = advantage_estimates.squeeze()
+            value_targets = value_targets.squeeze()
+            discounted_returns = discounted_returns.squeeze()
+            # ---------------------------------------
+
+            # 2. Calculate Surrogate (Actor) Loss
+            # Ratio: exp(current_log_prob - prev_log_prob)
+            ratio = torch.exp(current_log_probs - prev_log_probs)
+            
+            # Unclipped and Clipped surrogate objectives
+            surrogate_loss_1 = advantage_estimates * ratio
+            surrogate_loss_2 = advantage_estimates * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            
+            # We want to MAXIMIZE the surrogate objective, so we MINIMIZE its negative
+            surrogate_loss = -torch.min(surrogate_loss_1, surrogate_loss_2).mean()
+
+            # 3. Calculate Value (Critic) Loss
+            if self.use_clipped_value_loss:
+                # Clip the value estimate to prevent too large of a value update
+                value_error_unclipped = (current_values - discounted_returns) ** 2
+                current_values_clipped = value_targets + torch.clamp(
+                    current_values - value_targets, -self.clip_param, self.clip_param
+                )
+                value_error_clipped = (current_values_clipped - discounted_returns) ** 2
+                value_loss = torch.max(value_error_unclipped, value_error_clipped).mean()
+            else:
+                value_loss = ((current_values - discounted_returns) ** 2).mean()
+
+            # 4. Total Loss Computation
+            # Final loss = Actor Loss + (Value_Coef * Critic Loss) - (Entropy_Coef * Entropy)
+            entropy_loss = entropy.mean()
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_loss
+
+            # 5. Backpropagation step
+            self.optimizer.zero_grad() # Clear old gradients
+            loss.backward()            # Compute new gradients
+            # Clip gradients to prevent exploding gradients
+            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+            self.optimizer.step()      # Update the neural network weights
+
+            # 6. Accumulate metrics for tracking (Wandb/Terminal)
+            mean_value_loss += value_loss.item()
+            mean_surrogate_loss += surrogate_loss.item()
+            mean_entropy += entropy_loss.item()
             # TODO ----- END -----
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
