@@ -72,9 +72,40 @@ class DefaultQuadcopterStrategy:
         if your PPO implementation works. You should delete it or heavily modify it once you begin the racing task."""
 
         # TODO ----- START ----- Define the tensors required for your custom reward structure
-        # 1. GATE DETECTION: Widen the bubble to 0.8m 
-        dist_to_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
-        gate_passed = dist_to_gate < 0.4
+        # 1. GATE DETECTION: 2D Bounding Box + Directional Lock
+        curr_gate_idx = self.env._idx_wp
+        gate_pos = self.env._waypoints[curr_gate_idx, :3]
+        gate_forward = self.env._normal_vectors[curr_gate_idx, :] 
+
+        # Calculate drone's position and velocity in the world frame
+        drone_pos = self.env._robot.data.root_link_pos_w
+        drone_vel = self.env._robot.data.root_lin_vel_w
+        vec_gate_to_drone = drone_pos - gate_pos
+
+        # Construct gate's local coordinate frame (Forward, Right, Up)
+        world_up = torch.tensor([0.0, 0.0, 1.0], device=self.device).expand_as(gate_forward)
+        gate_right = torch.cross(gate_forward, world_up, dim=1)
+        gate_right = gate_right / (torch.linalg.norm(gate_right, dim=1, keepdim=True) + 1e-8)
+        gate_up = torch.cross(gate_right, gate_forward, dim=1)
+
+        # Project the vector from gate to drone onto the gate's local frame to get local coordinates
+        local_x = torch.sum(vec_gate_to_drone * gate_forward, dim=1)
+        local_y = torch.sum(vec_gate_to_drone * gate_right, dim=1)
+        local_z = torch.sum(vec_gate_to_drone * gate_up, dim=1)
+
+        #  A. Bounding Box Check: Is the drone within a box around the gate? (This encourages it to actually fly through the gate, not just near it)
+        in_box_x = torch.abs(local_x) < 0.25
+        in_box_y = torch.abs(local_y) < 0.45
+        in_box_z = torch.abs(local_z) < 0.45
+        is_inside_box = in_box_x & in_box_y & in_box_z
+
+        # B. Directional Check: Is the drone flying in the correct direction through the gate? (This encourages it to fly through the gate in the right direction, not just back and forth)
+        vel_alignment = torch.sum(drone_vel * gate_forward, dim=1)
+        is_going_forward = vel_alignment > 0.5 
+
+        # Combine the checks to determine if the gate is passed
+        gate_passed = is_inside_box & is_going_forward
+
         ids_gate_passed = torch.where(gate_passed)[0]
         self.env._idx_wp[ids_gate_passed] = (self.env._idx_wp[ids_gate_passed] + 1) % self.env._waypoints.shape[0]
 
