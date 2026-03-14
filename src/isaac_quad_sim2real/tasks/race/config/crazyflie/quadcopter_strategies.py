@@ -72,67 +72,15 @@ class DefaultQuadcopterStrategy:
         if your PPO implementation works. You should delete it or heavily modify it once you begin the racing task."""
 
         # TODO ----- START ----- Define the tensors required for your custom reward structure
-        # 1. GATE DETECTION: Plane Crossing Detection (平面跨越检测)
-        curr_gate_idx = self.env._idx_wp
-        drone_pos = self.env._robot.data.root_link_pos_w
-
-        gate_pos = self.env._waypoints[curr_gate_idx, :3]
-        gate_quat = self.env._waypoints_quat[curr_gate_idx, :]
-
-        # 使用自带的 subtract_frame_transforms 将无人机坐标转换到当前门的局部坐标系
-        local_pos_b, _ = subtract_frame_transforms(
-            gate_pos, 
-            gate_quat, 
-            drone_pos, 
-            self.env._robot.data.root_quat_w
-        )
-
-        curr_local_x = local_pos_b[:, 0]
-        curr_local_y = local_pos_b[:, 1]
-        curr_local_z = local_pos_b[:, 2]
-
-        # --- 核心逻辑 1：方向无关的跨越检测 (乘积法) ---
-        # 判断符号是否发生反转
-        sign_changed = (self.env._prev_x_drone_wrt_gate * curr_local_x) <= 0.0
-        
-        # 距离保护：上一帧必须在离门前后 1.5 米以内，防止远距离切换目标引起的数值突变
-        valid_distance = torch.abs(self.env._prev_x_drone_wrt_gate) < 1.5
-        crossed_plane = sign_changed & valid_distance
-
-        # --- 核心逻辑 2：穿越瞬间的框内判定 ---
-        in_gate_y = torch.abs(curr_local_y) < 0.35
-        in_gate_z = torch.abs(curr_local_z) < 0.35
-
-        # 必须同时满足 越过平面 & 在合法距离内 & 在门框范围内
-        gate_passed = crossed_plane & in_gate_y & in_gate_z
-
-        # --- 核心逻辑 3：正常更新历史状态 ---
-        self.env._prev_x_drone_wrt_gate = curr_local_x.clone()
-
-        # --- 核心逻辑 4：更新目标点及防御历史坐标污染 ---
+        # 1. GATE DETECTION: Widen the bubble to 0.8m 
+        dist_to_gate = torch.linalg.norm(self.env._pose_drone_wrt_gate, dim=1)
+        gate_passed = dist_to_gate < 0.4
         ids_gate_passed = torch.where(gate_passed)[0]
-        if len(ids_gate_passed) > 0:
-            # 1. 推进 Waypoint 索引
-            self.env._idx_wp[ids_gate_passed] = (self.env._idx_wp[ids_gate_passed] + 1) % self.env._waypoints.shape[0]
+        self.env._idx_wp[ids_gate_passed] = (self.env._idx_wp[ids_gate_passed] + 1) % self.env._waypoints.shape[0]
 
-            # 2. 更新 desired_pos_w
-            self.env._desired_pos_w[ids_gate_passed, :2] = self.env._waypoints[self.env._idx_wp[ids_gate_passed], :2]
-            self.env._desired_pos_w[ids_gate_passed, 2] = self.env._waypoints[self.env._idx_wp[ids_gate_passed], 2]
-
-            # 3. ⚠️ 极其关键：刷新刚穿过门的无人机的 prev_x ⚠️
-            # 因为下一帧将计算相对【新门】的 curr_local_x，
-            # 为了防止 (旧门的prev_x * 新门的curr_x <= 0) 导致瞬间连穿，必须重置它们相对于新门的 prev_x
-            new_gate_pos = self.env._waypoints[self.env._idx_wp[ids_gate_passed], :3]
-            new_gate_quat = self.env._waypoints_quat[self.env._idx_wp[ids_gate_passed], :]
-            
-            new_local_pos_b, _ = subtract_frame_transforms(
-                new_gate_pos, 
-                new_gate_quat, 
-                drone_pos[ids_gate_passed], 
-                self.env._robot.data.root_quat_w[ids_gate_passed] # 补齐参数
-            )
-            # 立即覆盖这些无人机的 prev_x 历史记录
-            self.env._prev_x_drone_wrt_gate[ids_gate_passed] = new_local_pos_b[:, 0].clone()
+        # Update target positions
+        self.env._desired_pos_w[ids_gate_passed, :2] = self.env._waypoints[self.env._idx_wp[ids_gate_passed], :2]
+        self.env._desired_pos_w[ids_gate_passed, 2] = self.env._waypoints[self.env._idx_wp[ids_gate_passed], 2]
 
         # 2. PRO RACING PROGRESS
         # Reward for making progress towards the gate, measured as the speed along the direction to the gate (encourages fast and direct flying towards the gate)
@@ -149,7 +97,7 @@ class DefaultQuadcopterStrategy:
         action_diff = torch.sum(torch.square(self.env._actions - self.env._previous_actions), dim=1)
         # Spin Penalty
         ang_vel = self.env._robot.data.root_ang_vel_w
-        spin_penalty = torch.sum(torch.square(ang_vel), dim=1) * 0.05
+        spin_penalty = torch.sum(torch.square(ang_vel), dim=1) * 0.01
 
         # Bonus for passing through the gate
         progress = progress + (gate_passed.float() * 10.0) - (action_diff * 0.005) - spin_penalty
@@ -377,6 +325,6 @@ class DefaultQuadcopterStrategy:
         )
 
         # self.env._prev_x_drone_wrt_gate[env_ids] = 1.0
-        self.env._prev_x_drone_wrt_gate[env_ids] = self.env._pose_drone_wrt_gate[env_ids][:, 0].clone()
+        self.env._prev_x_drone_wrt_gate[env_ids] = 1.0
 
         self.env._crashed[env_ids] = 0
