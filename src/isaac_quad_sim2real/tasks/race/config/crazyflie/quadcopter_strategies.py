@@ -91,7 +91,8 @@ class DefaultQuadcopterStrategy:
         curr_local_z = local_pos_b[:, 2]
 
         # Logic for detecting if the drone has just crossed the plane of the gate:
-        crossed_forward = (self.env._prev_x_drone_wrt_gate < 0.0) & (curr_local_x >= 0.0)
+        # crossed_forward = (self.env._prev_x_drone_wrt_gate < 0.0) & (curr_local_x >= 0.0)
+        crossed_forward = (self.env._prev_x_drone_wrt_gate > 0.0) & (curr_local_x <= 0.0)
         # To prevent false positives from drones that are very far away and just happen to cross the plane, we add a distance check.
         valid_distance = torch.abs(self.env._prev_x_drone_wrt_gate) < 1.5
         crossed_plane = crossed_forward & valid_distance
@@ -111,6 +112,8 @@ class DefaultQuadcopterStrategy:
 
         # Before we update the prev_x for the next step, we need to handle the case where a drone has just passed through the gate.
         self.env._prev_x_drone_wrt_gate = curr_local_x.clone()
+        self.env._prev_y_drone_wrt_gate = curr_local_y.clone()
+        self.env._prev_z_drone_wrt_gate = curr_local_z.clone()
 
         # Handle gate passage: For drones that passed through the gate, we need to:
         ids_gate_passed = torch.where(gate_passed)[0]
@@ -134,6 +137,8 @@ class DefaultQuadcopterStrategy:
             )
             # Set the previous x position relative to the new gate
             self.env._prev_x_drone_wrt_gate[ids_gate_passed] = new_local_pos_b[:, 0].clone()
+            self.env._prev_y_drone_wrt_gate[ids_gate_passed] = new_local_pos_b[:, 1].clone()
+            self.env._prev_z_drone_wrt_gate[ids_gate_passed] = new_local_pos_b[:, 2].clone()
 
         # 2. PRO RACING PROGRESS
         # Reward for making progress towards the gate, measured as the speed along the direction to the gate (encourages fast and direct flying towards the gate)
