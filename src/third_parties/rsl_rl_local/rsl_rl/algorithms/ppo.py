@@ -168,6 +168,9 @@ class PPO:
             # This forces all tensors to be flat 1D lists so they multiply line-by-line
             prev_log_probs = prev_log_probs.squeeze()
             advantage_estimates = advantage_estimates.squeeze()
+            # Advantage Normalization
+            advantage_estimates = (advantage_estimates - advantage_estimates.mean()) / (advantage_estimates.std() + 1e-8)
+
             value_targets = value_targets.squeeze()
             discounted_returns = discounted_returns.squeeze()
             # ---------------------------------------
@@ -191,9 +194,9 @@ class PPO:
                     current_values - value_targets, -self.clip_param, self.clip_param
                 )
                 value_error_clipped = (current_values_clipped - discounted_returns) ** 2
-                value_loss = torch.max(value_error_unclipped, value_error_clipped).mean()
+                value_loss = 0.5 * torch.max(value_error_unclipped, value_error_clipped).mean()
             else:
-                value_loss = ((current_values - discounted_returns) ** 2).mean()
+                value_loss = 0.5 * ((current_values - discounted_returns) ** 2).mean()
 
             # 4. Total Loss Computation
             # Final loss = Actor Loss + (Value_Coef * Critic Loss) - (Entropy_Coef * Entropy)
@@ -206,6 +209,27 @@ class PPO:
             # Clip gradients to prevent exploding gradients
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()      # Update the neural network weights
+
+            # ------------------------------------------------------------------
+            # ADD (Adaptive Learning Rate Scheduler)
+            # ------------------------------------------------------------------
+            if self.schedule in ["adaptive", "empirical"]:
+                with torch.no_grad():
+                    # Calculate Approximate KL Divergence
+                    # Formula: log_prob_old - log_prob_new
+                    kl_divergence = (prev_log_probs - current_log_probs).mean().item()
+
+                # If the policy has changed too drastically (taken too large a step, at risk of falling over) -> reduce learning rate
+                if kl_divergence > self.desired_kl * 2.0:
+                    self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                # If the policy has almost not changed (learning too slowly) -> increase learning rate
+                elif kl_divergence < self.desired_kl / 2.0 and kl_divergence >= 0.0:
+                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+
+                # Apply the calculated new learning rate to the PyTorch optimizer
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = self.learning_rate
+            # ------------------------------------------------------------------
 
             # 6. Accumulate metrics for tracking (Wandb/Terminal)
             mean_value_loss += value_loss.item()
