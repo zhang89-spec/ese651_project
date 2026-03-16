@@ -152,14 +152,15 @@ class DefaultQuadcopterStrategy:
         progress = torch.clamp(progress_speed, min=-10.0, max=10.0) * 0.2
 
         # Add a small penalty for changing actions too abruptly, to encourage smoother flying (but don't penalize it too much or it won't learn power loops!)
-        action_diff = torch.sum(torch.square(self.env._actions - self.env._previous_actions), dim=1)
+        action_diff = torch.sum(torch.square(self.env._actions - self.env._previous_actions), dim=1) * 0.005
         # Spin Penalty
         ang_vel = self.env._robot.data.root_ang_vel_w
         spin_penalty = torch.sum(torch.square(ang_vel), dim=1) * 0.01
+        spin_penalty = torch.clamp(spin_penalty, max=2.0)
         # Time penalty
-        time_penalty = 0.005 # 0.005
+        time_penalty = torch.ones_like(progress) * 0.005 # 0.005
         # Bonus for passing through the gate
-        progress = progress + (gate_passed.float() * 10.0) - (action_diff * 0.005) - spin_penalty - time_penalty
+
 
         # -------------------------------------------------------------
         # DELETED: self.env._last_distance_to_goal (No longer needed!)
@@ -177,6 +178,10 @@ class DefaultQuadcopterStrategy:
             # TODO ----- START ----- Compute per-timestep rewards by multiplying with your reward scales (in train_race.py)
             rewards = {
                 "progress_goal": progress * self.env.rew['progress_goal_reward_scale'],
+                "gate_passed": (gate_passed.float() * 10.0) * self.env.rew['progress_goal_reward_scale'],
+                "penalty_action": -1 * action_diff * self.env.rew['progress_goal_reward_scale'],
+                "penalty_spin": -1 * spin_penalty * self.env.rew['progress_goal_reward_scale'],
+                "penalty_time": -1 * time_penalty * self.env.rew['progress_goal_reward_scale'],
                 "crash": crashed * self.env.rew['crash_reward_scale'],
             }
             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
@@ -184,8 +189,15 @@ class DefaultQuadcopterStrategy:
                                 torch.ones_like(reward) * self.env.rew['death_cost'], reward)
 
             # Logging
+            # for key, value in rewards.items():
+            #     self._episode_sums[key] += value
             for key, value in rewards.items():
-                self._episode_sums[key] += value
+                # 如果这个键在计分板里不存在，就自动为所有的无人机创建一个全 0 的记录器！
+                if hasattr(self, '_episode_sums'):
+                    if key not in self._episode_sums:
+                        self._episode_sums[key] = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+                    self._episode_sums[key] += value
+
         else:   # This else condition implies eval is called with play_race.py. Can be useful to debug at test-time
             reward = torch.zeros(self.num_envs, device=self.device)
             # TODO ----- END -----
