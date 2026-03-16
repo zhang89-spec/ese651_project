@@ -91,11 +91,12 @@ class DefaultQuadcopterStrategy:
         curr_local_z = local_pos_b[:, 2]
 
         # Logic for detecting if the drone has just crossed the plane of the gate:
-        # crossed_forward = (self.env._prev_x_drone_wrt_gate < 0.0) & (curr_local_x >= 0.0)
         crossed_forward = (self.env._prev_x_drone_wrt_gate > 0.0) & (curr_local_x <= 0.0)
+        # cross in the wrong Direction
+        crossed_backward = (self.env._prev_x_drone_wrt_gate < 0.0) & (curr_local_x >= 0.0)
+
         # To prevent false positives from drones that are very far away and just happen to cross the plane, we add a distance check.
         valid_distance = torch.abs(self.env._prev_x_drone_wrt_gate) < 1.5
-        crossed_plane = crossed_forward & valid_distance
 
         alpha = self.env._prev_x_drone_wrt_gate / (self.env._prev_x_drone_wrt_gate - curr_local_x + 1e-8)
         alpha = torch.clamp(alpha, 0.0, 1.0)
@@ -108,7 +109,11 @@ class DefaultQuadcopterStrategy:
         in_gate_z = torch.abs(cross_z) < 0.45
 
         # Final gate passage condition: must cross the plane and be within the gate boundaries
-        gate_passed = crossed_plane & in_gate_y & in_gate_z
+        gate_passed = crossed_forward & valid_distance & in_gate_y & in_gate_z
+        # Detect if it passed through the gate in the wrong direction (for potential penalty)
+        gate_passed_wrong_way = crossed_backward & valid_distance & in_gate_y & in_gate_z
+        # Store the gate passage info in the environment for use in rewards and logging
+        self.env._gate_passed_wrong_way = gate_passed_wrong_way
 
         # Update previous local positions for the next step's crossing detection
         self.env._prev_x_drone_wrt_gate = curr_local_x.clone()
@@ -133,7 +138,7 @@ class DefaultQuadcopterStrategy:
                 new_gate_pos, 
                 new_gate_quat, 
                 drone_pos[ids_gate_passed], 
-                self.env._robot.data.root_quat_w[ids_gate_passed] # 补齐参数
+                self.env._robot.data.root_quat_w[ids_gate_passed] 
             )
             # Set the previous x position relative to the new gate
             self.env._prev_x_drone_wrt_gate[ids_gate_passed] = new_local_pos_b[:, 0].clone()
@@ -148,6 +153,12 @@ class DefaultQuadcopterStrategy:
         # speed along the direction to the gate (dot product of velocity and direction to gate)
         drone_vel = self.env._robot.data.root_lin_vel_w
         progress_speed = torch.sum(drone_vel * dir_to_gate, dim=1)
+
+        heading_to_gate_3 = (self.env._idx_wp == 3)
+        is_negative_progress = progress_speed < 0
+        mask_relax_penalty = heading_to_gate_3 & is_negative_progress
+        progress_speed[mask_relax_penalty] = progress_speed[mask_relax_penalty] * 0.1
+
         # Clamp the progress reward to prevent large spikes, and scale it down
         progress = torch.clamp(progress_speed, min=-10.0, max=10.0) * 0.2
 
@@ -155,8 +166,21 @@ class DefaultQuadcopterStrategy:
         action_diff = torch.sum(torch.square(self.env._actions - self.env._previous_actions), dim=1) * 0.005
         # Spin Penalty
         ang_vel = self.env._robot.data.root_ang_vel_w
-        spin_penalty = torch.sum(torch.square(ang_vel), dim=1) * 0.01
-        spin_penalty = torch.clamp(spin_penalty, max=2.0)
+
+        # 1. A simple spin penalty that penalizes all angular velocities equally (not ideal for racing, as it would discourage power loops)
+        # spin_penalty = torch.sum(torch.square(ang_vel), dim=1) * 0.01
+
+        # 2. A more nuanced spin penalty that penalizes pitch (Y-axis) less than roll and yaw, to allow for power loops (but still penalizes excessive spinning in all axes)
+        # ang_vel_weights = torch.tensor([1.0, 0.6, 1.0], device=self.device) # Penalize pitch less for power loops
+        # spin_penalty = torch.sum(ang_vel_weights * torch.square(ang_vel), dim=1) * 0.01
+
+        # 3. An adaptive spin penalty that penalizes pitch (Y-axis) less only when the drone is flying towards Gate 3, to allow for power loops on that specific gate (but still penalizes excessive spinning in all axes and at other gates)
+        ang_vel_weights = torch.ones((self.num_envs, 3), device=self.device)
+        # heading_to_gate_3 = (self.env._idx_wp == 2)
+        ang_vel_weights[heading_to_gate_3] = torch.tensor([0.5, 0.05, 1.0], device=self.device) 
+        spin_penalty = torch.sum(ang_vel_weights * torch.square(ang_vel), dim=1) * 0.01
+
+        spin_penalty = torch.clamp(spin_penalty, max=2.0) #
         # Time penalty
         time_penalty = torch.ones_like(progress) * 0.005 # 0.005
         # Bonus for passing through the gate
@@ -434,7 +458,7 @@ class DefaultQuadcopterStrategy:
         self.env._prev_y_drone_wrt_gate[env_ids] = self.env._pose_drone_wrt_gate[env_ids][:, 1].clone()
         self.env._prev_z_drone_wrt_gate[env_ids] = self.env._pose_drone_wrt_gate[env_ids][:, 2].clone()
         self.env._crashed[env_ids] = 0
-
+        self.env._gate_passed_wrong_way[env_ids] = False
 '''
 conda activate env_isaaclab
 export PYTHONPATH=$(pwd)
