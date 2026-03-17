@@ -146,18 +146,47 @@ class DefaultQuadcopterStrategy:
             self.env._prev_z_drone_wrt_gate[ids_gate_passed] = new_local_pos_b[:, 2].clone()
 
         # 2. PRO RACING PROGRESS
-        # Reward for making progress towards the gate, measured as the speed along the direction to the gate (encourages fast and direct flying towards the gate)
-        drone_to_gate_w = self.env._desired_pos_w - self.env._robot.data.root_link_pos_w
+        drone_pos = self.env._robot.data.root_link_pos_w
+        drone_vel = self.env._robot.data.root_lin_vel_w
+        # calculate the direction vector from the drone to the gate in world frame
+        drone_to_gate_w = self.env._desired_pos_w - drone_pos
         dist_to_gate = torch.linalg.norm(drone_to_gate_w, dim=1, keepdim=True) + 1e-8
         dir_to_gate = drone_to_gate_w / dist_to_gate
-        # speed along the direction to the gate (dot product of velocity and direction to gate)
-        drone_vel = self.env._robot.data.root_lin_vel_w
+        
+        # Default progress reward
         progress_speed = torch.sum(drone_vel * dir_to_gate, dim=1)
 
+        # ------------------------------------------------------------------
+        # Waypoint 3 Reward Shaping
+        # ------------------------------------------------------------------
         heading_to_gate_3 = (self.env._idx_wp == 3)
+        # 1. Calculate horizontal progress (X and Y axes)
+        drone_to_gate_xy = drone_to_gate_w[:, :2]
+        dist_to_gate_xy = torch.linalg.norm(drone_to_gate_xy, dim=1, keepdim=True) + 1e-8
+        dir_to_gate_xy = drone_to_gate_xy / dist_to_gate_xy
+        progress_xy = torch.sum(drone_vel[:, :2] * dir_to_gate_xy, dim=1)
+
+        # 2. Calculated custom progress for gate 3
+        # gate3_custom_progress = (progress_xy * 1.5) + (progress_z * 1.0)
+        progress_speed = torch.where(heading_to_gate_3, progress_xy, progress_speed)
+        # 3. Relax the penalty for flying backward/inverted over the top
         is_negative_progress = progress_speed < 0
         mask_relax_penalty = heading_to_gate_3 & is_negative_progress
         progress_speed[mask_relax_penalty] = progress_speed[mask_relax_penalty] * 0.1
+        # 4. Add a bonus for climbing up during the approach to gate 3 to encourage power loops 
+        # Calculate how high the drone is relative to the gate
+        relative_height = drone_pos[:, 2] - self.env._desired_pos_w[:, 2]
+        # Only True if the drone is heading to Gate 3 AND is less than 2.0 meters above it
+        is_climbing_phase = heading_to_gate_3 & (relative_height < 0.7)
+
+        # Reward positive Z velocity, but clamp negatives to 0 so we don't punish diving
+        z_vel_reward = torch.clamp(drone_vel[:, 2], min=0.0, max=3.0)
+
+        # Apply the reward ONLY during the climbing phase
+        climb_bonus = torch.where(is_climbing_phase, z_vel_reward * 0.5, 0.0)
+
+        progress_speed += climb_bonus
+        # ------------------------------------------------------------------
 
         # Clamp the progress reward to prevent large spikes, and scale it down
         progress = torch.clamp(progress_speed, min=-10.0, max=10.0) * 0.2
