@@ -176,8 +176,8 @@ class DefaultQuadcopterStrategy:
         # 4. Add a bonus for climbing up during the approach to gate 3 to encourage power loops 
         # Calculate how high the drone is relative to the gate
         relative_height = drone_pos[:, 2] - self.env._desired_pos_w[:, 2]
-        # Only True if the drone is heading to Gate 3 AND is less than 2.0 meters above it
-        is_climbing_phase = heading_to_gate_3 & (relative_height < 0.7)
+        # Only True if the drone is heading to Gate 3 AND is less than 1->1.5 meters above it
+        is_climbing_phase = heading_to_gate_3 & (relative_height < 1.5) 
 
         # Reward positive Z velocity, but clamp negatives to 0 so we don't punish diving
         z_vel_reward = torch.clamp(drone_vel[:, 2], min=0.0, max=3.0)
@@ -186,15 +186,39 @@ class DefaultQuadcopterStrategy:
         climb_bonus = torch.where(is_climbing_phase, z_vel_reward * 0.5, 0.0)
 
         progress_speed += climb_bonus
+
+        # ------------------------------------------------------------------
+        # 5. The "Upside Down" (Inversion) Bonus
+        # ------------------------------------------------------------------
+        # Extract the drone's orientation quaternion. (Assuming format is [w, x, y, z])
+        quat = self.env._robot.data.root_quat_w
+        
+        # Calculate the Z-component of the drone's local Up-vector in the World frame.
+        # Math: For quat [w, x, y, z], the Z component of the local Z-axis is 1 - 2(x^2 + y^2)
+        up_z = 1.0 - 2.0 * (quat[:, 1]**2 + quat[:, 2]**2)
+
+        # We want to encourage the drone to go inverted (up_z < 0), 
+        # BUT only when it's high enough to be safe (e.g., higher than 0.5->0.75 above the gate)
+        is_above_gate = heading_to_gate_3 & (relative_height > 0.75)
+
+        # If up_z is negative (inverted), -up_z becomes positive. 
+        inversion_bonus = torch.clamp(-up_z, min=0.0)
+
+        # Apply the bonus (Multiplier of 2.0 or 3.0 gives a strong incentive to flip)
+        flip_reward = torch.where(is_above_gate, inversion_bonus * 5.0, 0.0)
+        
         # ------------------------------------------------------------------
 
         # Clamp the progress reward to prevent large spikes, and scale it down
-        progress = torch.clamp(progress_speed, min=-10.0, max=10.0) * 0.2
+        # progress = torch.clamp(progress_speed, min=-10.0, max=10.0) * 0.2
+        progress = torch.clamp(progress_speed, min=-13.0, max=13.0) * 0.2
+        progress += flip_reward
 
         # Add a small penalty for changing actions too abruptly, to encourage smoother flying (but don't penalize it too much or it won't learn power loops!)
         action_diff = torch.sum(torch.square(self.env._actions - self.env._previous_actions), dim=1) * 0.005
         # Spin Penalty
-        ang_vel = self.env._robot.data.root_ang_vel_w
+        # ang_vel = self.env._robot.data.root_ang_vel_w
+        ang_vel = self.env._robot.data.root_ang_vel_b
 
         # 1. A simple spin penalty that penalizes all angular velocities equally (not ideal for racing, as it would discourage power loops)
         # spin_penalty = torch.sum(torch.square(ang_vel), dim=1) * 0.01
