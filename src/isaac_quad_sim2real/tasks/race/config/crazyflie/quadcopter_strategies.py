@@ -199,21 +199,23 @@ class DefaultQuadcopterStrategy:
         # BUT only when it's high enough to be safe (e.g., higher than 0.5->0.75 above the gate)
         is_above_gate = heading_to_gate_3 & (relative_height > 0.75)
         # If up_z is negative (inverted), -up_z becomes positive. 
-        inversion_bonus = (- 1.0 ) * up_z * 2
+        inversion_bonus = (- 1.0 ) * up_z * 5
         # Apply the bonus (Multiplier of 2.0 or 3.0 gives a strong incentive to flip)
-        flip_proportional_reward = torch.where(is_above_gate, inversion_bonus, 0.0) 
+        flip_proportional_reward = torch.where(is_above_gate, inversion_bonus, 0.0)  
 
         # Extract the drone's local angular velocity (spin rates)
         ang_vel = self.env._robot.data.root_ang_vel_b
         pitch_rate = ang_vel[:, 1]
         # 1. Is the drone actively trying to flip? (Spinning backward faster than 0.5 rad/s)
-        is_pitching_backward = pitch_rate > 0.8
+        is_pitching_backward = pitch_rate > 0.5
         # 2. Give a FIXED, UNSCALED reward just for the effort of pitching.
-        active_flip_bonus = torch.where(is_above_gate & is_pitching_backward, 3.0, 0.0)
+        active_flip_bonus = torch.where(is_above_gate & is_pitching_backward, 0.8, 0.0)
 
         # Total reward
         flip_reward = active_flip_bonus + flip_proportional_reward
         
+        # (2,3)too big -> (0.5, 0.5) too small
+
         # ------------------------------------------------------------------
 
         # Clamp the progress reward to prevent large spikes, and scale it down
