@@ -192,33 +192,39 @@ class DefaultQuadcopterStrategy:
         # ------------------------------------------------------------------
         # Extract the drone's orientation quaternion. (Assuming format is [w, x, y, z])
         quat = self.env._robot.data.root_quat_w
-        
         # Calculate the Z-component of the drone's local Up-vector in the World frame.
         # Math: For quat [w, x, y, z], the Z component of the local Z-axis is 1 - 2(x^2 + y^2)
         up_z = 1.0 - 2.0 * (quat[:, 1]**2 + quat[:, 2]**2)
-
         # We want to encourage the drone to go inverted (up_z < 0), 
         # BUT only when it's high enough to be safe (e.g., higher than 0.5->0.75 above the gate)
         is_above_gate = heading_to_gate_3 & (relative_height > 0.75)
-
         # If up_z is negative (inverted), -up_z becomes positive. 
-        inversion_bonus = torch.clamp(-up_z, min=0.0)
-
+        inversion_bonus = (- 1.0 ) * up_z * 2
         # Apply the bonus (Multiplier of 2.0 or 3.0 gives a strong incentive to flip)
-        flip_reward = torch.where(is_above_gate, inversion_bonus * 5.0, 0.0)
+        flip_proportional_reward = torch.where(is_above_gate, inversion_bonus, 0.0) 
+
+        # Extract the drone's local angular velocity (spin rates)
+        ang_vel = self.env._robot.data.root_ang_vel_b
+        pitch_rate = ang_vel[:, 1]
+        # 1. Is the drone actively trying to flip? (Spinning backward faster than 0.5 rad/s)
+        is_pitching_backward = pitch_rate > 0.8
+        # 2. Give a FIXED, UNSCALED reward just for the effort of pitching.
+        active_flip_bonus = torch.where(is_above_gate & is_pitching_backward, 3.0, 0.0)
+
+        # Total reward
+        flip_reward = active_flip_bonus + flip_proportional_reward
         
         # ------------------------------------------------------------------
 
         # Clamp the progress reward to prevent large spikes, and scale it down
         # progress = torch.clamp(progress_speed, min=-10.0, max=10.0) * 0.2
         progress = torch.clamp(progress_speed, min=-13.0, max=13.0) * 0.2
-        progress += flip_reward
 
         # Add a small penalty for changing actions too abruptly, to encourage smoother flying (but don't penalize it too much or it won't learn power loops!)
         action_diff = torch.sum(torch.square(self.env._actions - self.env._previous_actions), dim=1) * 0.005
         # Spin Penalty
         # ang_vel = self.env._robot.data.root_ang_vel_w
-        ang_vel = self.env._robot.data.root_ang_vel_b
+        # ang_vel = self.env._robot.data.root_ang_vel_b
 
         # 1. A simple spin penalty that penalizes all angular velocities equally (not ideal for racing, as it would discourage power loops)
         # spin_penalty = torch.sum(torch.square(ang_vel), dim=1) * 0.01
@@ -229,7 +235,6 @@ class DefaultQuadcopterStrategy:
 
         # 3. An adaptive spin penalty that penalizes pitch (Y-axis) less only when the drone is flying towards Gate 3, to allow for power loops on that specific gate (but still penalizes excessive spinning in all axes and at other gates)
         ang_vel_weights = torch.ones((self.num_envs, 3), device=self.device)
-        # heading_to_gate_3 = (self.env._idx_wp == 2)
         ang_vel_weights[heading_to_gate_3] = torch.tensor([1.0, 0.05, 1.0], device=self.device) 
         spin_penalty = torch.sum(ang_vel_weights * torch.square(ang_vel), dim=1) * 0.01
 
@@ -260,6 +265,8 @@ class DefaultQuadcopterStrategy:
                 "penalty_spin": -1 * spin_penalty * self.env.rew['progress_goal_reward_scale'],
                 "penalty_time": -1 * time_penalty * self.env.rew['progress_goal_reward_scale'],
                 "crash": crashed * self.env.rew['crash_reward_scale'],
+                # for power loop
+                "flip_reward": flip_reward * self.env.rew['progress_goal_reward_scale']
             }
             reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
             reward = torch.where(self.env.reset_terminated,
@@ -332,6 +339,9 @@ class DefaultQuadcopterStrategy:
         # 3. What was I just doing?
         prev_actions = self.env._previous_actions
 
+        # 4. "Am I at Gate 3?" (Crucial so the drone knows flipping is now legal!)
+        is_gate_3 = (current_gate_idx == 3).float().unsqueeze(-1)
+
         obs = torch.cat(
             [
                 drone_lin_vel_b,    # (3) How fast am I moving?
@@ -340,7 +350,9 @@ class DefaultQuadcopterStrategy:
                 gate_pos_b,         # (3) Where is the center of the current gate?
                 gate_quat_b,        # (4) 🌟 Which way is the current gate facing?
                 next_gate_pos_b,    # (3) 🌟 Where is the next gate? (Lookahead)
-                prev_actions        # (4) What were my last motor commands?
+                prev_actions,        # (4) What were my last motor commands?
+                # for power loop
+                is_gate_3,          # (1) Is this the Power Loop gate? (1.0 or 0.0)
             ],
             dim=-1,
         )
